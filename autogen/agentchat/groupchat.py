@@ -36,6 +36,7 @@ from ..runtime_logging import log_new_agent, logging_enabled
 from .agent import Agent
 from .contrib.capabilities import transform_messages
 from .conversable_agent import ConversableAgent
+from .group.inter_agent_guardrails import apply_inter_agent_guardrails  # optional external API
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +175,7 @@ class GroupChat:
     )
 
     allowed_speaker_transitions_dict: dict[str, list[Agent]] = field(init=False)
+    _inter_agent_guardrails: list = field(default_factory=list, init=False)
 
     def __post_init__(self):
         # Post init steers clears of the automatically generated __init__ method from dataclass
@@ -1055,6 +1057,31 @@ class GroupChat:
                 return f"{guardrail.activation_message}\nJustification: {guardrail_result.justification}"
         return None
 
+    def _run_inter_agent_guardrails(
+        self,
+        *,
+        src_agent_name: str,
+        dst_agent_name: str,
+        message_content: Union[str, list[dict[str, Any]]],
+    ) -> Optional[str]:
+        """Run manifest-driven inter-agent guardrails, if any are configured.
+
+        Returns optional replacement content when a guardrail triggers.
+        """
+        guardrails = getattr(self, "_inter_agent_guardrails", None)
+        if not guardrails:
+            return None
+        for gr in guardrails:
+            reply = gr.check_and_act(
+                groupchat=self,
+                src_agent_name=src_agent_name,
+                dst_agent_name=dst_agent_name,
+                message_content=message_content,
+            )
+            if reply is not None:
+                return reply
+        return None
+
 
 @export_module("autogen")
 class GroupChatManager(ConversableAgent):
@@ -1189,6 +1216,7 @@ class GroupChatManager(ConversableAgent):
         message = messages[-1]
         speaker = sender
         groupchat = config
+
         send_introductions = getattr(groupchat, "send_introductions", False)
         silent = getattr(self, "_silent", False)
         termination_reason = None
@@ -1211,7 +1239,20 @@ class GroupChatManager(ConversableAgent):
             # broadcast the message to all agents except the speaker
             for agent in groupchat.agents:
                 if agent != speaker:
-                    self.send(message, agent, request_reply=False, silent=True)
+                    inter_reply = groupchat._run_inter_agent_guardrails(
+                        src_agent_name=speaker.name,
+                        dst_agent_name=agent.name,
+                        message_content=message,
+                    )
+                    if inter_reply is not None:
+                        replacement = (
+                            {"content": inter_reply, "name": speaker.name}
+                            if not isinstance(inter_reply, dict)
+                            else inter_reply
+                        )
+                        self.send(replacement, agent, request_reply=False, silent=True)
+                    else:
+                        self.send(message, agent, request_reply=False, silent=True)
             if self._is_termination_msg(message):
                 # The conversation is over
                 termination_reason = f"Termination message condition on the GroupChatManager '{self.name}' met"
@@ -1333,7 +1374,20 @@ class GroupChatManager(ConversableAgent):
             # broadcast the message to all agents except the speaker
             for agent in groupchat.agents:
                 if agent != speaker:
-                    await self.a_send(message, agent, request_reply=False, silent=True)
+                    inter_reply = groupchat._run_inter_agent_guardrails(
+                        src_agent_name=speaker.name,
+                        dst_agent_name=agent.name,
+                        message_content=message,
+                    )
+                    if inter_reply is not None:
+                        replacement = (
+                            {"content": inter_reply, "name": speaker.name}
+                            if not isinstance(inter_reply, dict)
+                            else inter_reply
+                        )
+                        await self.a_send(replacement, agent, request_reply=False, silent=True)
+                    else:
+                        await self.a_send(message, agent, request_reply=False, silent=True)
             if i == groupchat.max_round - 1:
                 # the last round
                 termination_reason = f"Maximum rounds ({groupchat.max_round}) reached"
